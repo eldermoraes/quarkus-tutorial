@@ -1,0 +1,309 @@
+name: windows-pr-check
+
+# Validates the PowerShell examples of an upstream PR to 12_security.adoc
+# (JWT RBAC chapter) on a real Windows runner, in Windows PowerShell 5.1
+# and in PowerShell 7, with the real curl.exe.
+#
+# The PowerShell blocks, the SecureResource versions and the properties are
+# extracted from the PR's adoc and run as written. The tutorial app is
+# generated on the runner, following the chapter.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number in redhat-developer-demos/quarkus-tutorial"
+        required: true
+        default: "184"
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: redhat-developer-demos/quarkus-tutorial
+  ADOC_PATH: documentation/modules/ROOT/pages/12_security.adoc
+  QUARKUS_VERSION: 3.40.1.1
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Fetch the PR's 12_security.adoc
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $meta = gh api "repos/$env:UPSTREAM/pulls/$env:PR" | ConvertFrom-Json
+          $headRepo = $meta.head.repo.full_name
+          $sha = $meta.head.sha
+          Write-Host "PR #$($env:PR): $($meta.title)"
+          Write-Host "Head: $headRepo@$sha"
+          $files = gh api "repos/$env:UPSTREAM/pulls/$env:PR/files" --jq '.[].filename'
+          Write-Host "Files changed in the PR:"; $files | ForEach-Object { Write-Host "  $_" }
+          $url = "https://raw.githubusercontent.com/$headRepo/$sha/$env:ADOC_PATH"
+          Write-Host "Downloading $url"
+          $adoc = Join-Path $work '12_security.adoc'
+          Invoke-WebRequest -Uri $url -OutFile $adoc -UseBasicParsing
+          Write-Host "Saved $((Get-Item $adoc).Length) bytes"
+
+      - name: Extract code blocks from the adoc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          $lines = Get-Content -LiteralPath (Join-Path $work '12_security.adoc') -Encoding utf8
+          # Collect every listing block: a [source,<lang>...] line, then ----, body, ----
+          $blocks = @()
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\[source,([A-Za-z0-9_-]+)') {
+              $lang = $Matches[1]
+              $j = $i + 1
+              if ($j -lt $lines.Count -and $lines[$j].Trim() -eq '----') {
+                $body = @()
+                $k = $j + 1
+                while ($k -lt $lines.Count -and $lines[$k].Trim() -ne '----') { $body += $lines[$k]; $k++ }
+                $blocks += [pscustomobject]@{ Lang = $lang; Line = $i + 1; Body = ($body -join "`r`n") }
+                $i = $k
+              }
+            }
+          }
+          $ps    = @($blocks | Where-Object Lang -eq 'powershell')
+          $java  = @($blocks | Where-Object Lang -eq 'java')
+          $props = @($blocks | Where-Object Lang -eq 'properties')
+          Write-Host "Found: $($ps.Count) powershell, $($java.Count) java, $($props.Count) properties blocks"
+          if ($ps.Count -ne 4)    { throw "Expected 4 PowerShell blocks in the PR adoc, found $($ps.Count)" }
+          if ($java.Count -ne 3)  { throw "Expected 3 Java blocks (SecureResource versions), found $($java.Count)" }
+          if ($props.Count -ne 1) { throw "Expected 1 properties block, found $($props.Count)" }
+          $bom = New-Object System.Text.UTF8Encoding $true
+          $out = Join-Path $work 'blocks'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          for ($n = 0; $n -lt 4; $n++) {
+            $f = Join-Path $out "ps$($n + 1).ps1"
+            [IO.File]::WriteAllText($f, $ps[$n].Body + "`r`n", $bom)
+            Write-Host "---- ps$($n + 1).ps1 (adoc line $($ps[$n].Line)) ----"; Write-Host $ps[$n].Body
+          }
+          for ($n = 0; $n -lt 3; $n++) {
+            $f = Join-Path $out "java$($n + 1).java"
+            [IO.File]::WriteAllText($f, $java[$n].Body + "`r`n", (New-Object System.Text.UTF8Encoding $false))
+            $ra = ($java[$n].Body -split "`r`n" | Where-Object { $_ -match '@RolesAllowed' }) -join ' '
+            if (-not $ra) { $ra = '(no @RolesAllowed)' }
+            Write-Host "java$($n + 1).java (adoc line $($java[$n].Line)): $($ra.Trim())"
+          }
+          [IO.File]::WriteAllText((Join-Path $out 'app.properties'), $props[0].Body + "`r`n", (New-Object System.Text.UTF8Encoding $false))
+          Write-Host "---- properties ----"; Write-Host $props[0].Body
+
+      - name: Write helper scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          $bom = New-Object System.Text.UTF8Encoding $true
+
+          # phase.ps1: stop the running app, install a SecureResource version, package, start, wait.
+          $phase = @'
+          param([Parameter(Mandatory)][int]$Version)
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          $app  = Join-Path $work 'tutorial-app'
+          $pidFile = Join-Path $work 'app.pid'
+          if (Test-Path $pidFile) {
+            $old = [int](Get-Content $pidFile)
+            Stop-Process -Id $old -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            Remove-Item $pidFile
+          }
+          $dst = Join-Path $app 'src\main\java\com\redhat\developers\SecureResource.java'
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+          Copy-Item (Join-Path $work "blocks\java$Version.java") $dst -Force
+          Write-Host "SecureResource version $Version installed:"; Get-Content $dst | Write-Host
+          Push-Location $app
+          & .\mvnw.cmd -B -q package "-DskipTests"
+          if ($LASTEXITCODE -ne 0) { throw "mvnw package failed for SecureResource version $Version" }
+          $log = Join-Path $work "app-v$Version.log"
+          $err = Join-Path $work "app-v$Version.err.log"
+          $p = Start-Process -FilePath 'java' -ArgumentList '-jar', 'target\quarkus-app\quarkus-run.jar' `
+                 -WorkingDirectory $app -RedirectStandardOutput $log -RedirectStandardError $err -PassThru
+          Pop-Location
+          Set-Content -Path $pidFile -Value $p.Id
+          $ready = $false
+          for ($t = 0; $t -lt 90; $t++) {
+            Start-Sleep -Seconds 2
+            if ($p.HasExited) { break }
+            $code = & curl.exe -s -o NUL -w '%{http_code}' http://localhost:8080/secure/claim
+            if ($code -and $code -ne '000') { $ready = $true; break }
+          }
+          if (-not $ready) {
+            Write-Host "---- app stdout ----"; if (Test-Path $log) { Get-Content $log | Write-Host }
+            Write-Host "---- app stderr ----"; if (Test-Path $err) { Get-Content $err | Write-Host }
+            throw "App (SecureResource version $Version) did not become ready on :8080"
+          }
+          Write-Host "App ready (pid $($p.Id)), SecureResource version $Version"
+          exit 0
+          '@
+          [IO.File]::WriteAllText((Join-Path $work 'phase.ps1'), $phase, $bom)
+
+          # check.ps1: run one PR block as written, compare with the expected result, record it.
+          # Must stay compatible with Windows PowerShell 5.1.
+          $check = @'
+          param([Parameter(Mandatory)][int]$Block, [Parameter(Mandatory)][string]$Case,
+                [Parameter(Mandatory)][int]$ExpectStatus, [string]$ExpectBody = '')
+          $ErrorActionPreference = 'Continue'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          $shellName = 'pwsh ' + $PSVersionTable.PSVersion.ToString()
+          if ($PSVersionTable.PSEdition -eq 'Desktop') { $shellName = 'Windows PowerShell ' + $PSVersionTable.PSVersion.ToString() }
+          $file = Join-Path $work "blocks\ps$Block.ps1"
+          Write-Host "==== [$shellName] $Case : running ps$Block.ps1 from the PR ===="
+          Get-Content $file | ForEach-Object { Write-Host "PS> $_" }
+          $raw = & $file 2>&1 | ForEach-Object { "$_" }
+          Write-Host "---- output ----"; $raw | ForEach-Object { Write-Host $_ }
+          $text = ($raw -join "`n")
+          # Status as seen in the block's own output (-v), else from a status-only call with the same token.
+          $status = $null
+          $m = [regex]::Matches($text, '<\s*HTTP/[0-9.]+\s+([0-9]{3})')
+          if ($m.Count -gt 0) { $status = [int]$m[$m.Count - 1].Groups[1].Value; $src = 'block -v output' }
+          else {
+            if ($Block -eq 2) { $tok = 'XXXX' }
+            else { $tok = (curl.exe -s https://raw.githubusercontent.com/redhat-developer-demos/quarkus-tutorial/master/jwt-token/quarkus.jwt.token).Trim() }
+            $status = [int](curl.exe -s -o NUL -w '%{http_code}' -H "Authorization: Bearer $tok" http://localhost:8080/secure/claim)
+            $src = 'status-only call, same token'
+          }
+          $stdoutLines = @($raw | Where-Object { $_ -notmatch '^\s*[*<>{}]' -and $_.Trim() -ne '' })
+          $body = ''
+          if ($stdoutLines.Count -gt 0) { $body = $stdoutLines[$stdoutLines.Count - 1].Trim() }
+          $ok = ($status -eq $ExpectStatus)
+          if ($ExpectBody -ne '') { $ok = $ok -and ($body -eq $ExpectBody) }
+          $verdict = 'FAIL'; if ($ok) { $verdict = 'PASS' }
+          $exp = "$ExpectStatus"; if ($ExpectBody) { $exp += " $ExpectBody" }
+          $got = "$status"; if ($ExpectBody) { $got += " $body" }
+          $line = "$verdict | $shellName | $Case | expected: $exp | got: $got ($src)"
+          Write-Host $line
+          Add-Content -Path (Join-Path $work 'results.txt') -Value $line
+          if (-not $ok) { Write-Host "::error::$line" }
+          exit 0
+          '@
+          [IO.File]::WriteAllText((Join-Path $work 'check.ps1'), $check, $bom)
+          Write-Host "Helpers written."
+
+      - name: Generate the tutorial app (as the chapter says)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          Push-Location $work
+          mvn -B -q "io.quarkus.platform:quarkus-maven-plugin:$($env:QUARKUS_VERSION):create" `
+            "-DprojectGroupId=com.redhat.developers" "-DprojectArtifactId=tutorial-app" `
+            "-Dextensions=rest" "-DnoCode"
+          if ($LASTEXITCODE -ne 0) { throw "quarkus create failed" }
+          Pop-Location
+          Push-Location (Join-Path $work 'tutorial-app')
+          # Chapter, "Add the JWT extension" (Maven tab)
+          & .\mvnw.cmd -B -q quarkus:add-extension -D"extension=quarkus-smallrye-jwt"
+          if ($LASTEXITCODE -ne 0) { throw "add-extension failed" }
+          # Chapter, "Add the JWT properties"
+          $props = 'src\main\resources\application.properties'
+          Add-Content -Path $props -Value (Get-Content (Join-Path $work 'blocks\app.properties'))
+          Write-Host "---- application.properties ----"; Get-Content $props | Write-Host
+          Select-String -Path pom.xml -Pattern '<artifactId>quarkus-' | ForEach-Object { Write-Host $_.Line.Trim() }
+          Pop-Location
+          exit 0
+
+      - name: Versions (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+          (Get-Command curl.exe).Source
+          curl.exe --version
+          exit 0
+
+      - name: Versions (pwsh 7)
+        shell: pwsh
+        run: |
+          $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+          (Get-Command curl.exe).Source
+          curl.exe --version
+          java -version
+          exit 0
+
+      - name: "Phase 1: SecureResource without RBAC"
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP\prcheck\phase.ps1" -Version 1'
+
+      - name: "Phase 1 checks (Windows PowerShell 5.1)"
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 1 -Case 'valid token' -ExpectStatus 200 -ExpectBody 'jdoe'
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 2 -Case 'token XXXX' -ExpectStatus 401
+          exit 0
+
+      - name: "Phase 1 checks (pwsh 7)"
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 1 -Case 'valid token' -ExpectStatus 200 -ExpectBody 'jdoe'
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 2 -Case 'token XXXX' -ExpectStatus 401
+          exit 0
+
+      - name: "Phase 2: @RolesAllowed(\"Subscriber\")"
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP\prcheck\phase.ps1" -Version 2'
+
+      - name: "Phase 2 check (Windows PowerShell 5.1)"
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 3 -Case 'RolesAllowed Subscriber' -ExpectStatus 200 -ExpectBody 'jdoe'
+          exit 0
+
+      - name: "Phase 2 check (pwsh 7)"
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 3 -Case 'RolesAllowed Subscriber' -ExpectStatus 200 -ExpectBody 'jdoe'
+          exit 0
+
+      - name: "Phase 3: @RolesAllowed(\"Not-Subscriber\")"
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP\prcheck\phase.ps1" -Version 3'
+
+      - name: "Phase 3 check (Windows PowerShell 5.1)"
+        shell: powershell
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 4 -Case 'RolesAllowed Not-Subscriber' -ExpectStatus 403
+          exit 0
+
+      - name: "Phase 3 check (pwsh 7)"
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\prcheck\check.ps1" -Block 4 -Case 'RolesAllowed Not-Subscriber' -ExpectStatus 403
+          exit 0
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        env:
+          PR: ${{ inputs.pr }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'prcheck'
+          $pidFile = Join-Path $work 'app.pid'
+          if (Test-Path $pidFile) { Stop-Process -Id ([int](Get-Content $pidFile)) -Force -ErrorAction SilentlyContinue }
+          $res = Join-Path $work 'results.txt'
+          if (-not (Test-Path $res)) { Write-Host "::error::No results recorded (setup failed before the checks)"; exit 1 }
+          $lines = @(Get-Content $res)
+          Write-Host "==== Results ===="; $lines | ForEach-Object { Write-Host $_ }
+          "## PR #$($env:PR) PowerShell examples on Windows" | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          $lines | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          $fail = @($lines | Where-Object { $_ -like 'FAIL*' })
+          if ($lines.Count -ne 8) { Write-Host "::error::Expected 8 results (4 cases x 2 shells), got $($lines.Count)"; exit 1 }
+          if ($fail.Count -gt 0) { Write-Host "::error::$($fail.Count) of 8 checks diverged from the chapter"; exit 1 }
+          Write-Host "All 8 checks match the chapter (jdoe / 401 / 200 jdoe / 403) in Windows PowerShell 5.1 and pwsh 7."
+          exit 0
