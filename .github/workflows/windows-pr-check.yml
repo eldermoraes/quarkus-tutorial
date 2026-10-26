@@ -126,10 +126,21 @@ jobs:
           $dst = Join-Path $app 'src\main\java\com\redhat\developers\SecureResource.java'
           New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
           Copy-Item (Join-Path $work "blocks\java$Version.java") $dst -Force
+          # Copy-Item keeps the old timestamp; without a fresh one (and clean) Maven reuses the previous class.
+          (Get-Item $dst).LastWriteTime = Get-Date
           Write-Host "SecureResource version $Version installed:"; Get-Content $dst | Write-Host
           Push-Location $app
-          & .\mvnw.cmd -B -q package "-DskipTests"
+          & .\mvnw.cmd -B -q clean package "-DskipTests"
           if ($LASTEXITCODE -ne 0) { throw "mvnw package failed for SecureResource version $Version" }
+          # Guard: the compiled class must carry the same @RolesAllowed as the source.
+          $cls = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $app 'target\classes\com\redhat\developers\SecureResource.class')))
+          $src = Get-Content $dst -Raw
+          if ($src -match '@RolesAllowed\("([^"]+)"\)') {
+            $role = $Matches[1]
+            if (-not $cls.Contains("RolesAllowed") -or -not $cls.Contains($role)) { throw "Compiled class does not carry @RolesAllowed(`"$role`")" }
+            Write-Host "Compiled class carries @RolesAllowed(`"$role`")"
+          } elseif ($cls.Contains("RolesAllowed")) { throw "Compiled class has @RolesAllowed but the source has none" }
+          else { Write-Host "Compiled class has no @RolesAllowed, as the source" }
           $log = Join-Path $work "app-v$Version.log"
           $err = Join-Path $work "app-v$Version.err.log"
           Pop-Location
